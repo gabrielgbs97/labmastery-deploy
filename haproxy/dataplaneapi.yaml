@@ -1,0 +1,22 @@
+# Configuracio del sidecar de la Data Plane API (haproxytech/dataplaneapi).
+#
+# El sidecar llegeix la configuracio d'HAProxy, la modifica segons les peticions de
+# l'API i la recarrega. La contrasenya de l'usuari d'administracio NO viu aqui: es
+# la del userlist del haproxy.cfg (gestor de secrets del desplegament, D23 §7).
+dataplaneapi:
+  host: 0.0.0.0
+  port: 5555
+  userlist:
+    # Nom de la seccio userlist del haproxy.cfg que defineix l'usuari de l'API.
+    userlist: admins
+
+haproxy:
+  # Config efectivo (copia escribible de la plantilla). El sidecar lo reescribe.
+  config_file: /var/lib/dataplaneapi/haproxy.cfg
+  haproxy_bin: /usr/local/sbin/haproxy
+  reload:
+    reload_delay: 5
+    service_name: haproxy
+    reload_strategy: custom
+    reload_cmd: /usr/local/sbin/lm-reload
+    restart_cmd: /usr/local/sbin/lm-reload

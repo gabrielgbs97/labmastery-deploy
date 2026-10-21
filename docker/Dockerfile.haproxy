@@ -1,0 +1,33 @@
+# HAProxy 3.0 + Data Plane API (D23, 08-despliegue.md §4.3).
+#
+# La Data Plane API no va dentro del binario d'HAProxy: es un sidecar en Go
+# (haproxytech/dataplaneapi) que parla con la socket admin y regenera la configuración.
+# Por eso la imagen lleva los dos, y el sidecar tiene que vivir en el MISMO contenedor
+# que HAProxy: sólo así puede recargar su configuración en caliente.
+#
+# Versión del sidecar: la misma major que el HAProxy (3.0.x).
+FROM haproxy:3.0-alpine
+
+USER root
+
+# Sidecar de la Data Plane API.
+ARG DATAPLANEAPI_VERSION=3.0.26
+# El .apk oficial lleva una firma que `apk add` rechaza en una imagen base ajena al
+# repositorio de Alpine. Como el .apk es un tar.gz (formato Alpine), se extrae a mano.
+ADD https://github.com/haproxytech/dataplaneapi/releases/download/v${DATAPLANEAPI_VERSION}/dataplaneapi_${DATAPLANEAPI_VERSION}_linux_amd64.apk /tmp/dataplaneapi.apk
+RUN tar -xzf /tmp/dataplaneapi.apk -C /tmp \
+    && install -m 0755 /tmp/usr/sbin/dataplaneapi /usr/local/sbin/dataplaneapi \
+    && rm -rf /tmp/dataplaneapi.apk /tmp/usr
+
+# La plantilla de configuración (gestionada por git) va como .base: el sidecar
+# trabaja sobre una copia escribible en el volumen de estado.
+COPY haproxy/haproxy.cfg /etc/haproxy/haproxy.cfg.base
+COPY haproxy/dataplaneapi.yaml /etc/haproxy/dataplaneapi.yaml
+COPY haproxy/reload.sh /usr/local/sbin/lm-reload
+COPY haproxy/entrypoint.sh /usr/local/sbin/lm-entrypoint
+
+RUN chmod +x /usr/local/sbin/lm-reload /usr/local/sbin/lm-entrypoint \
+    && mkdir -p /run/haproxy /var/lib/dataplaneapi \
+    && chown haproxy:haproxy /run/haproxy
+
+ENTRYPOINT ["/usr/local/sbin/lm-entrypoint"]

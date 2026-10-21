@@ -22,8 +22,16 @@ labmastery-deploy/
 │   ├── templates/env.j2      # plantilla del .env
 │   └── vault/secrets.yml     # secretos del despliegue (cifrados con ansible-vault)
 ├── haproxy/
-│   ├── haproxy.cfg           # configuración ESTÁTICA (frontends, TLS, backends base)
+│   ├── haproxy.cfg           # configuración ESTÁTICA (frontends, TLS, backends base) — plantilla
+│   ├── dataplaneapi.yaml     # configuración del sidecar de la Data Plane API
+│   ├── reload.sh             # recarga en caliente (USR2 al master de HAProxy)
+│   ├── entrypoint.sh         # arranca HAProxy + el sidecar; copia la plantilla al volumen
 │   └── certs/                # certificados TLS (NO se commitean)
+├── docker/
+│   ├── Dockerfile.haproxy    # HAProxy 3.0 + el sidecar de la Data Plane API
+│   ├── Dockerfile.web
+│   ├── Dockerfile.console
+│   └── Dockerfile.orchestrator
 ├── vault/
 │   ├── policies/             # una política por servicio (mínimo privilegio)
 │   └── init.sh               # inicialización (root token, mounts)
@@ -143,6 +151,26 @@ labmastery/
   (`haproxy.dataplane.*` en `orch.settings`).
 
 La Data Plane API no puede definir frontends, listeners ni TLS: por eso el reparto es estructural.
+
+### La Data Plane API no va dentro de HAProxy
+
+Es un **sidecar en Go** (`haproxytech/dataplaneapi`) que vive en el **mismo contenedor** que HAProxy
+(la imagen `docker/Dockerfile.haproxy`): habla con HAProxy por el socket de administración, modifica su
+configuración y la recarga en caliente.
+
+Tres requisitos que impone HAProxy 3.0:
+
+1. **HAProxy arranca en modo master-worker (`-W`)**. Sin él no existe el comando `reload` del socket de
+   administración, y sin recarga en caliente no se pueden publicar rutas de lab sin cortar conexiones.
+2. **La configuración debe estar en un fichero escribible**. La plantilla `haproxy/haproxy.cfg` se monta en
+   solo lectura como `haproxy.cfg.base`; `haproxy/entrypoint.sh` la copia al volumen `haproxy-state`
+   (`/var/lib/dataplaneapi/haproxy.cfg`) y el sidecar trabaja sobre esa copia.
+3. **El usuario de la API va en un `userlist` con hash SHA-512** (`password`, no `insecure-password`):
+   la API autentica con *basic auth* contra los usuarios del propio HAProxy.
+
+El orquestador se conecta al puerto `5555` de la red de gestión. El contrato HTTP completo (rutas, cabeceras
+`version`, formato de `servers`, ACLs y reglas `use_backend`) está en
+[`08-despliegue.md` §4.3](../labmastery-docs/08-despliegue.md) del repo de documentación.
 
 ## Vault: mínimo privilegio
 

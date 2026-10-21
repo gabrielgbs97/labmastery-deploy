@@ -43,6 +43,8 @@ volumes:
   vault-audit:
     name: ${STACK_NAME:-labmastery}-vault-audit
 
+  haproxy-state:
+    name: ${STACK_NAME:-labmastery}-haproxy-state
 services:
   # --- PostgreSQL ------------------------------------------------------------
   # El DDL se aplica en el arranque (labmastery-db/sql/*.sql, en orden).
@@ -220,16 +222,27 @@ services:
   # Único servicio con puerto publicado. Termina TLS y enruta al web y a la
   # consola. Las rutas dinámicas de los labs las añade el orquestador en
   # runtime vía Data Plane API (haproxy.dataplane.*).
+  # HAProxy + el sidecar de la Data Plane API (docker/Dockerfile.haproxy). El sidecar
+  # vive en el MISMO contenedor que HAProxy: así puede recargar su configuración en
+  # caliente (USR2 al master) cuando el orquestador publica una ruta de lab.
   haproxy:
-    image: haproxy:3.0-alpine
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.haproxy
+    image: labmastery/haproxy:3.0
     restart: unless-stopped
     logging: *logging
     volumes:
-      - ./haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+      - ./haproxy/haproxy.cfg:/etc/haproxy/haproxy.cfg.base:ro
       - ./haproxy/certs:/etc/haproxy/certs:ro
+      - haproxy-state:/var/lib/dataplaneapi
     ports:
       - "${HTTPS_PORT:-443}:443"
       - "${HTTP_PORT:-80}:80"
+    # La Data Plane API se escucha en la red de gestión; el orquestador la usa para
+    # publicar y retirar las rutas de los labs en runtime.
+    expose:
+      - "5555"
     healthcheck:
       test: ["CMD-SHELL", "haproxy -c -f /usr/local/etc/haproxy/haproxy.cfg"]
       interval: 30s
