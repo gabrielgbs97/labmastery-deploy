@@ -1,0 +1,98 @@
+# syntax=docker/dockerfile:1.7
+# LabMastery — imagen de la consola (BFF Fastify + SPA Nuxt UI).
+#
+# CONTEXTO DE BUILD: la raiz de los repos (c:\dev\LabMastery).
+#
+#   docker build -f labmastery-deploy/docker/Dockerfile.console -t labmastery-console .
+#
+# Igual que el web (ver Dockerfile.web para el porque de los symlinks y del
+# type stripping), con una diferencia: la consola usa mas paquetes
+# compartidos (config, i18n, lab-renderer, lab-schema, orchestrator-client,
+# settings-registry, secret-store).
+
+# ---------- Etapa 1: dependencias --------------------------------------------
+FROM node:24-alpine AS deps
+WORKDIR /app
+
+COPY labmastery-packages /app/labmastery-packages
+COPY labmastery-console/package.json ./labmastery-console/
+COPY labmastery-console/server/package.json ./labmastery-console/server/
+COPY labmastery-console/web/package.json ./labmastery-console/web/
+
+# npm NO instala las dependencias de los paquetes `file:` (solo crea el
+# symlink). Las deps externas de los paquetes compartidos (shiki, marked,
+# openapi-fetch...) se instalan explicitamente aqui.
+RUN cd /app/labmastery-console \
+ && npm install --no-audit --no-fund \
+ && cd /app/labmastery-packages \
+ && npm install --no-audit --no-fund --omit=dev --no-save \
+      $(node -e "const p=require('./packages/lab-renderer/package.json'),q=require('./packages/orchestrator-client/package.json'),r=require('./packages/config/package.json'),s=require('./packages/lab-schema/package.json');const d={...p.dependencies,...q.dependencies,...r.dependencies,...s.dependencies};console.log(Object.entries(d).map(([k,v])=>k+'@'+v.replace(/^\^/,'')).join(' '))")
+
+# ---------- Etapa 2: front (SPA) ---------------------------------------------
+FROM node:24-alpine AS front
+WORKDIR /app
+
+COPY --from=deps /app/labmastery-packages ./labmastery-packages
+COPY --from=deps /app/labmastery-console/node_modules ./labmastery-console/node_modules
+COPY labmastery-console/web ./labmastery-console/web
+# El front importa ficheros del server (p. ej. src/content/md-protect.ts):
+# hacen falta en la etapa de build.
+COPY labmastery-console/server ./labmastery-console/server
+
+# Los symlinks de @labmastery/* apuntan a rutas de Windows: hay que rehacerlos.
+RUN set -eux; \
+    mkdir -p ./labmastery-console/node_modules/@labmastery; \
+    for n in config i18n lab-renderer lab-schema orchestrator-client secret-store settings-registry; do \
+      [ -d "/app/labmastery-packages/packages/$n" ] || continue; \
+      ln -sfn "/app/labmastery-packages/packages/$n" "./labmastery-console/node_modules/@labmastery/$n"; \
+    done
+
+WORKDIR /app/labmastery-console/web
+RUN npm run build
+
+# ---------- Etapa 3: aplicacion ----------------------------------------------
+FROM node:24-alpine AS app
+WORKDIR /app
+
+ENV NODE_ENV=production
+
+COPY --from=deps /app/labmastery-console/node_modules /app/node_modules
+
+# El codigo de los paquetes, FUERA de node_modules (para el type stripping).
+# Su node_modules se conserva: ahi estan las deps externas de los paquetes.
+COPY --from=deps /app/labmastery-packages /opt/pkgs
+
+# Los symlinks que npm creo en /opt/pkgs/node_modules apuntan a rutas del host
+# de build (C:\...): hay que rehacerlos.
+RUN set -eux; \
+    mkdir -p /opt/pkgs/node_modules/@labmastery; \
+    for n in config i18n lab-renderer lab-schema orchestrator-client secret-store settings-registry; do \
+      [ -d "/opt/pkgs/packages/$n" ] || continue; \
+      ln -sfn "/opt/pkgs/packages/$n" "/opt/pkgs/node_modules/@labmastery/$n"; \
+    done
+
+COPY labmastery-console/package.json ./labmastery-console/
+COPY labmastery-console/server ./labmastery-console/server
+COPY --from=front /app/labmastery-console/web/dist ./labmastery-console/web/dist
+
+# Symlinks de los paquetes `file:` tambien en el node_modules de la app.
+RUN set -eux; \
+    mkdir -p /app/node_modules/@labmastery; \
+    for n in config i18n lab-renderer lab-schema orchestrator-client secret-store settings-registry; do \
+      [ -d "/opt/pkgs/packages/$n" ] || continue; \
+      ln -sfn "/opt/pkgs/packages/$n" "/app/node_modules/@labmastery/$n"; \
+    done
+
+WORKDIR /app/labmastery-console
+
+USER node
+
+EXPOSE 4100
+
+ENV PORT=4100 \
+    HOST=0.0.0.0
+
+HEALTHCHECK --interval=15s --timeout=5s --start-period=20s --retries=10 \
+  CMD node -e "fetch('http://127.0.0.1:4100/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+
+CMD ["node", "server/src/index.ts"]

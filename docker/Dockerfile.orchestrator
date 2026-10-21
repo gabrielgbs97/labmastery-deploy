@@ -1,0 +1,80 @@
+# syntax=docker/dockerfile:1.7
+# LabMastery — imagen del orquestrador.
+#
+# CONTEXTO DE BUILD: la raiz de los repos (c:\dev\LabMastery).
+#
+#   docker build -f labmastery-deploy/docker/Dockerfile.orchestrator -t labmastery-orchestrator .
+#
+# EL TRUCO DE LOS PAQUETS `file:` (D23 §4.1): los paquetes `@labmastery/*`
+# exportan codigo FUENTE (.ts). Node 24 hace type stripping, pero NO dentro
+# de node_modules (ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING). La solucion:
+# que el codigo real de los paquetes viva FUERA de node_modules.
+#
+#   /opt/pkgs/packages/config/src/*.ts   <- el fuente, fuera de node_modules
+#
+# npm NO instala las dependencias de los paquetes `file:` (solo crea el
+# symlink), asi que las deps externas de los paquetes (zod, openapi-fetch...)
+# se instalan explicitamente en labmastery-packages.
+
+# ---------- Etapa 1: dependencias --------------------------------------------
+FROM node:24-alpine AS deps
+WORKDIR /app
+
+COPY labmastery-packages /app/labmastery-packages
+COPY labmastery-orchestrator/package.json ./labmastery-orchestrator/
+
+RUN cd /app/labmastery-orchestrator \
+ && npm install --no-audit --no-fund \
+ && cd /app/labmastery-packages \
+ && npm install --no-audit --no-fund --omit=dev --no-save \
+      $(node -e "const p=require('./packages/lab-renderer/package.json'),q=require('./packages/orchestrator-client/package.json'),r=require('./packages/config/package.json'),s=require('./packages/lab-schema/package.json');const d={...p.dependencies,...q.dependencies,...r.dependencies,...s.dependencies};console.log(Object.entries(d).map(([k,v])=>k+'@'+v.replace(/^\^/,'')).join(' '))")
+
+# ---------- Etapa 2: aplicacion ----------------------------------------------
+FROM node:24-alpine AS app
+WORKDIR /app
+
+ENV NODE_ENV=production
+
+# Un unico node_modules, el de la app.
+COPY --from=deps /app/labmastery-orchestrator/node_modules /app/node_modules
+
+# El codigo de los paquetes, FUERA de node_modules (para el type stripping).
+# Su node_modules se conserva: ahi estan las deps externas de los paquetes.
+COPY --from=deps /app/labmastery-packages /opt/pkgs
+
+# Los symlinks que npm creo en /opt/pkgs/node_modules apuntan a rutas del host
+# de build (C:\...): hay que rehacerlos.
+RUN set -eux; \
+    mkdir -p /opt/pkgs/node_modules/@labmastery; \
+    for n in config i18n lab-renderer lab-schema orchestrator-client secret-store settings-registry; do \
+      [ -d "/opt/pkgs/packages/$n" ] || continue; \
+      ln -sfn "/opt/pkgs/packages/$n" "/opt/pkgs/node_modules/@labmastery/$n"; \
+    done
+
+COPY labmastery-orchestrator/package.json ./labmastery-orchestrator/
+COPY labmastery-orchestrator/src ./labmastery-orchestrator/src
+COPY labmastery-orchestrator/config ./labmastery-orchestrator/config
+COPY labmastery-orchestrator/openapi ./labmastery-orchestrator/openapi
+COPY labmastery-orchestrator/tsconfig.json ./labmastery-orchestrator/
+
+# Symlinks de los paquetes `file:` tambien en el node_modules de la app.
+RUN set -eux; \
+    mkdir -p /app/node_modules/@labmastery; \
+    for n in config i18n lab-renderer lab-schema orchestrator-client secret-store settings-registry; do \
+      [ -d "/opt/pkgs/packages/$n" ] || continue; \
+      ln -sfn "/opt/pkgs/packages/$n" "/app/node_modules/@labmastery/$n"; \
+    done
+
+WORKDIR /app/labmastery-orchestrator
+
+USER node
+
+EXPOSE 4000
+
+ENV PORT=4000 \
+    HOST=0.0.0.0
+
+HEALTHCHECK --interval=15s --timeout=5s --start-period=20s --retries=10 \
+  CMD node -e "fetch('http://127.0.0.1:4000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+
+CMD ["node", "src/index.ts"]
