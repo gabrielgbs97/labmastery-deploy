@@ -1,0 +1,106 @@
+# LabMastery — compose de DESARROLLO.
+#
+#   docker compose --profile dev up -d
+#
+# Monta los repos en vez de usar imágenes, deja PostgreSQL con datos efímeros
+# y arranca Vault en modo dev (token raíz fijo, todo en memoria).
+#
+# NO usar en producción: aquí las contraseñas son de desarrollo y los datos
+# no se persisten.
+
+services:
+  postgres:
+    environment:
+      POSTGRES_PASSWORD: postgres
+      LM_DB_ROLES: "lm_web=lm_web_dev,lm_console=lm_console_dev,lm_orchestrator=lm_orchestrator_dev,lm_reporting=lm_reporting_dev"
+      LM_DB_PASSWORDS: "lm_web_dev,lm_console_dev,lm_orchestrator_dev,lm_reporting_dev"
+    volumes:
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+      # Sin volumen: datos efímeros en cada arranque.
+
+  s3:
+    environment:
+      RUSTFS_ACCESS_KEY: lmdevaccess
+      RUSTFS_SECRET_KEY: lmdevsecret123
+
+  vault:
+    image: hashicorp/vault:1.20
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID: prova
+      VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
+    command: server -dev
+    volumes: []  # modo dev: todo en memoria
+
+  orchestrator:
+    image: node:24-alpine
+    working_dir: /app
+    command: node --experimental-strip-types src/index.ts
+    environment:
+      NODE_ENV: development
+      PORT: "4000"
+      DATABASE_URL: postgres://lm_orchestrator:lm_orchestrator_dev@postgres:5432/labmastery
+      ORCH_CLIENTS: '[{"clientId":"console","token":"dev-console-token"},{"clientId":"web","token":"dev-web-token"}]'
+      ORCH_SECRET_KEY: ZGV2LW9yY2gtc2VjcmV0LWtleS0zMi1ieXRlcy1sb25nISE=
+      GATEWAY_TOKEN_SECRET: dev-gateway-token-secret
+      SETTINGS_SECRET_STORES: "[]"
+      ORCH_PROVIDER: mock
+    volumes:
+      - ../labmastery-orchestrator:/app
+      - ../labmastery-packages:/labmastery-packages
+    networks:
+      - mgmt
+      - data
+
+  web:
+    image: node:24-alpine
+    working_dir: /app
+    command: node --experimental-strip-types server/src/index.ts
+    environment:
+      NODE_ENV: development
+      PORT: "3000"
+      DATABASE_URL: postgres://lm_web:lm_web_dev@postgres:5432/labmastery
+      WEB_SECRET_KEY: dev-web-secret-key-32-bytes-long!!
+      OWNER_REF_SECRET: dev-owner-ref-secret
+      SESSION_SECRET: dev-session-secret
+      ORCH_TOKEN: dev-console-token
+      ORCH_URL: http://orchestrator:4000
+      SETTINGS_SECRET_STORES: "[]"
+      S3_ENDPOINT: http://s3:9000
+      S3_ACCESS_KEY_ID: lmdevaccess
+      S3_SECRET_ACCESS_KEY: lmdevsecret123
+    volumes:
+      - ../labmastery-web:/app
+      - ../labmastery-packages:/labmastery-packages
+    networks:
+      - mgmt
+      - data
+
+  console:
+    image: node:24-alpine
+    working_dir: /app
+    command: node --experimental-strip-types server/src/index.ts
+    environment:
+      NODE_ENV: development
+      PORT: "4100"
+      DATABASE_URL: postgres://lm_console:lm_console_dev@postgres:5432/labmastery
+      SESSION_SECRET: dev-session-secret
+      OWNER_REF_SECRET: dev-owner-ref-secret
+      ORCH_TOKEN: dev-console-token
+      ORCH_URL: http://orchestrator:4000
+      SETTINGS_SECRET_STORES: "[]"
+      AUTH_MODE: dev
+      OAUTH_PUBLIC_URL: http://localhost:4100
+      CONSOLE_DEV_USERS: '[{"username":"admin","password":"admin","role":"admin"}]'
+      S3_ENDPOINT: http://s3:9000
+      S3_ACCESS_KEY_ID: lmdevaccess
+      S3_SECRET_ACCESS_KEY: lmdevsecret123
+    volumes:
+      - ../labmastery-console:/app
+      - ../labmastery-packages:/labmastery-packages
+    networks:
+      - mgmt
+      - data
+
+  haproxy:
+    ports:
+      - "${DEV_HTTP_PORT:-8080}:80"

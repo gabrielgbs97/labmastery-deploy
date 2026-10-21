@@ -1,0 +1,48 @@
+name: Validar el despliegue
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  compose:
+    name: El compose y los ficheros de configuracion son validos
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validar compose.yaml
+        run: docker compose --env-file .env.example config --quiet
+
+      - name: Validar compose.override.yaml
+        run: docker compose --env-file .env.example -f compose.override.yaml config --quiet
+
+      - name: Validar el YAML de ansible
+        run: |
+          python3 -c "import yaml,sys; [yaml.safe_load(open(f)) for f in ['ansible/site.yml','ansible/vault/secrets.yml']]; print('YAML ok')"
+
+      - name: Validar los scripts de shell
+        run: |
+          sudo apt-get update && sudo apt-get install -y shellcheck
+          shellcheck -e SC1091 scripts/*.sh postgres/init/*.sh vault/init.sh
+
+      - name: Comprobar que no se commitea ningun secreto
+        run: |
+          # El .env real nunca debe estar en el repo.
+          if git ls-files --error-unmatch .env >/dev/null 2>&1; then
+            echo "ERROR: el .env esta commiteado"; exit 1
+          fi
+          # El vault de ansible SÍ debe estar (cifrado), pero sin la contrasena.
+          if git ls-files --error-unmatch vault_password >/dev/null 2>&1; then
+            echo "ERROR: hay un vault_password en el repo"; exit 1
+          fi
+          echo "Sin secretos en el repo."
+
+      - name: Comprobar que el vault de ansible esta cifrado
+        run: |
+          if head -1 ansible/vault/secrets.yml | grep -q '\$ANSIBLE_VAULT'; then
+            echo "El vault esta cifrado. OK."
+          else
+            echo "ERROR: ansible/vault/secrets.yml NO esta cifrado"; exit 1
+          fi

@@ -1,0 +1,241 @@
+# LabMastery — composició completa del sistema.
+#
+# Un sol compose per a tot el sistema (D23). Els repos de servei NO tenen compose:
+# el codi i la topologia són coses separades.
+#
+#   docker compose up -d              # producción
+#   docker compose --profile dev up -d # desarrollo (monta los repos, Vault en dev)
+#
+# El fichero .env lo genera el playbook de ansible-vault y NO se commitea.
+
+name: labmastery
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+# --- Redes -------------------------------------------------------------------
+# Tres redes: edge (Internet), mgmt (entre servicios y hacia el almacén),
+# data (PostgreSQL y S3). Solo HAProxy publica puertos.
+
+networks:
+  edge:
+    name: ${STACK_NAME:-labmastery}-edge
+    driver: bridge
+  mgmt:
+    name: ${STACK_NAME:-labmastery}-mgmt
+    driver: bridge
+    internal: true
+  data:
+    name: ${STACK_NAME:-labmastery}-data
+    driver: bridge
+    internal: true
+
+volumes:
+  pgdata:
+    name: ${STACK_NAME:-labmastery}-pgdata
+  s3data:
+    name: ${STACK_NAME:-labmastery}-s3data
+  vaultdata:
+    name: ${STACK_NAME:-labmastery}-vaultdata
+  vault-audit:
+    name: ${STACK_NAME:-labmastery}-vault-audit
+
+services:
+  # --- PostgreSQL ------------------------------------------------------------
+  # El DDL se aplica en el arranque (labmastery-db/sql/*.sql, en orden).
+  # Contraseñas de los roles: las genera el playbook (ver postgres/init).
+  postgres:
+    image: postgres:18-alpine
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-labmastery}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?falta POSTGRES_PASSWORD (lo genera el playbook)}
+      LM_DB_ROLES: ${LM_DB_ROLES:?falta LM_DB_ROLES (lo genera el playbook)}
+      LM_DB_PASSWORDS: ${LM_DB_PASSWORDS:?falta LM_DB_PASSWORDS (lo genera el playbook)}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-labmastery}"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    networks:
+      - data
+      - mgmt
+
+  # --- S3 (RustFS) ------------------------------------------------------------
+  s3:
+    image: rustfs/rustfs:latest
+    restart: unless-stopped
+    logging: *logging
+    command: /data --console-address ":9001"
+    environment:
+      RUSTFS_ACCESS_KEY: ${S3_ACCESS_KEY_ID:?falta S3_ACCESS_KEY_ID (lo genera el playbook)}
+      RUSTFS_SECRET_KEY: ${S3_SECRET_ACCESS_KEY:?falta S3_SECRET_ACCESS_KEY (lo genera el playbook)}
+      RUSTFS_VOLUMES: /data
+    volumes:
+      - s3data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9000/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - data
+      - mgmt
+
+  # --- Vault (OpenBao) --------------------------------------------------------
+  # Modo server con almacenamiento persistente. NO es un depends_on de los
+  # servicios: si Vault no está, cada servicio arranca igual y sus secretos
+  # quedan sin resolver (D22: "un fallo de un nivel no es una caída").
+  vault:
+    image: hashicorp/vault:1.20
+    restart: unless-stopped
+    logging: *logging
+    cap_add:
+      - IPC_LOCK
+    environment:
+      VAULT_ADDR: http://127.0.0.1:8200
+      VAULT_API_ADDR: http://vault:8200
+      VAULT_DEV_ROOT_TOKEN_ID: ${VAULT_DEV_ROOT_TOKEN_ID:-}
+      VAULT_LOCAL_CONFIG: |
+        {
+          "storage": { "file": { "path": "/vault/data" } },
+          "listener": {
+            "tcp": { "address": "0.0.0.0:8200", "tls_disable": true }
+          },
+          "ui": true,
+          "api_addr": "http://vault:8200"
+        }
+    command: server
+    volumes:
+      - vaultdata:/vault/data
+      - vault-audit:/vault/audit
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8200/v1/sys/health | grep -q '\"initialized\":true'"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - mgmt
+
+  # --- Orquestrador ----------------------------------------------------------
+  orchestrator:
+    image: ${IMAGE_ORCHESTRATOR:?falta IMAGE_ORCHESTRATOR (tag inmutable)}
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      NODE_ENV: production
+      PORT: "4000"
+      HOST: 0.0.0.0
+      DATABASE_URL: ${DATABASE_URL_ORCH:?falta DATABASE_URL_ORCH}
+      ORCH_CLIENTS: ${ORCH_CLIENTS:?falta ORCH_CLIENTS}
+      ORCH_SECRET_KEY: ${ORCH_SECRET_KEY:?falta ORCH_SECRET_KEY}
+      GATEWAY_TOKEN_SECRET: ${GATEWAY_TOKEN_SECRET:?falta GATEWAY_TOKEN_SECRET}
+      SETTINGS_SECRET_STORES: ${SETTINGS_SECRET_STORES:?falta SETTINGS_SECRET_STORES}
+      ORCH_PROVIDER: ${ORCH_PROVIDER:-mock}
+      LOG_PRETTY: "0"
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:4000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks:
+      - mgmt
+      - data
+
+  # --- Web -------------------------------------------------------------------
+  web:
+    image: ${IMAGE_WEB:?falta IMAGE_WEB (tag inmutable)}
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      HOST: 0.0.0.0
+      DATABASE_URL: ${DATABASE_URL_WEB:?falta DATABASE_URL_WEB}
+      WEB_SECRET_KEY: ${WEB_SECRET_KEY:?falta WEB_SECRET_KEY}
+      OWNER_REF_SECRET: ${OWNER_REF_SECRET:?falta OWNER_REF_SECRET}
+      SESSION_SECRET: ${SESSION_SECRET:?falta SESSION_SECRET}
+      ORCH_TOKEN: ${ORCH_TOKEN:?falta ORCH_TOKEN}
+      ORCH_URL: ${ORCH_URL:-http://orchestrator:4000}
+      SETTINGS_SECRET_STORES: ${SETTINGS_SECRET_STORES:?falta SETTINGS_SECRET_STORES}
+      S3_ENDPOINT: ${S3_ENDPOINT:-http://s3:9000}
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:?falta S3_ACCESS_KEY_ID}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:?falta S3_SECRET_ACCESS_KEY}
+      LOG_PRETTY: "0"
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks:
+      - mgmt
+      - data
+
+  # --- Consola ----------------------------------------------------------------
+  console:
+    image: ${IMAGE_CONSOLE:?falta IMAGE_CONSOLE (tag inmutable)}
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      NODE_ENV: production
+      PORT: "4100"
+      HOST: 0.0.0.0
+      DATABASE_URL: ${DATABASE_URL_CONSOLE:?falta DATABASE_URL_CONSOLE}
+      SESSION_SECRET: ${SESSION_SECRET:?falta SESSION_SECRET}
+      OWNER_REF_SECRET: ${OWNER_REF_SECRET:?falta OWNER_REF_SECRET}
+      ORCH_TOKEN: ${ORCH_TOKEN:?falta ORCH_TOKEN}
+      ORCH_URL: ${ORCH_URL:-http://orchestrator:4000}
+      SETTINGS_SECRET_STORES: ${SETTINGS_SECRET_STORES:?falta SETTINGS_SECRET_STORES}
+      AUTH_MODE: ${AUTH_MODE:-oauth}
+      OAUTH_PUBLIC_URL: ${OAUTH_PUBLIC_URL:?falta OAUTH_PUBLIC_URL}
+      CONSUME_OAUTH_USERS: ${CONSOLE_OAUTH_USERS:-[]}
+      S3_ENDPOINT: ${S3_ENDPOINT:-http://s3:9000}
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:?falta S3_ACCESS_KEY_ID}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:?falta S3_SECRET_ACCESS_KEY}
+      LOG_PRETTY: "0"
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:4100/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks:
+      - mgmt
+      - data
+
+  # --- HAProxy ----------------------------------------------------------------
+  # Único servicio con puerto publicado. Termina TLS y enruta al web y a la
+  # consola. Las rutas dinámicas de los labs las añade el orquestador en
+  # runtime vía Data Plane API (haproxy.dataplane.*).
+  haproxy:
+    image: haproxy:3.0-alpine
+    restart: unless-stopped
+    logging: *logging
+    volumes:
+      - ./haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+      - ./haproxy/certs:/etc/haproxy/certs:ro
+    ports:
+      - "${HTTPS_PORT:-443}:443"
+      - "${HTTP_PORT:-80}:80"
+    healthcheck:
+      test: ["CMD-SHELL", "haproxy -c -f /usr/local/etc/haproxy/haproxy.cfg"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    networks:
+      - edge
+      - mgmt

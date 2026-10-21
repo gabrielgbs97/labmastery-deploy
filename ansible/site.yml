@@ -1,0 +1,146 @@
+---
+# LabMastery — playbook de despliegue.
+#
+# Orden (D23 §5.1):
+#   1. Descifra el vault de ansible.
+#   2. Inicializa Vault (root token, politica, mount KV v2) — solo la 1a vez.
+#   3. Genera el .env del compose con las variables de ARRANQUE (capa 1 de D22).
+#   4. Levanta el compose.
+#   5. Verifica.
+#
+# Principio: nada de esto escribe un secreto en el repo. El .env generado
+# vive solo en el host, con permisos 0600, y esta en .gitignore.
+
+- name: Despliegue de LabMastery
+  hosts: labmastery
+  become: true
+  gather_facts: true
+
+  vars:
+    deploy_root: /opt/labmastery
+    compose_file: "{{ deploy_root }}/compose.yaml"
+
+    # --- Datos que vienen del vault de ansible -----------------------------
+    # (contenidas en ansible/vault/secrets.yml, cifrado con ansible-vault)
+    labmastery_stack_name: labmastery
+    labmastery_postgres_password: ""
+    labmastery_db_passwords: {}          # { lm_web: ..., lm_console: ... }
+    labmastery_web_secret_key: ""
+    labmastery_owner_ref_secret: ""
+    labmastery_session_secret: ""
+    labmastery_orch_secret_key: ""
+    labmastery_orch_clients: ""          # JSON
+    labmastery_secret_stores: ""         # JSON: [ { UUID -> credencial } ]
+    labmastery_vault_root_token: ""      # solo si Vault ya esta inicializado
+    labmastery_s3_access_key: ""
+    labmastery_s3_secret_key: ""
+    labmastery_oauth_public_url: ""
+
+  tasks:
+    # --- 0. Estructura de directorios ---------------------------------------
+    - name: Crear el arbol de directorios
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0750"
+      loop:
+        - "{{ deploy_root }}"
+        - "{{ deploy_root }}/postgres/init"
+
+    # --- 1. Copiar el DDL canonico -------------------------------------------
+    # El DDL lo aplica el contenedor de PostgreSQL al arrancar.
+    - name: Montar el DDL de labmastery-db en el contenedor
+      ansible.builtin.copy:
+        src: "{{ repos_root }}/labmastery-db/sql/"
+        dest: "{{ deploy_root }}/ddl/sql/"
+        mode: "0644"
+      when: repos_root is defined
+
+    # --- 2. Generar el .env (capa 1 de D22) ----------------------------------
+    # NUNCA se commitea. Permisos 0600: solo el servicio lo lee.
+    - name: Generar el .env del compose
+      ansible.builtin.template:
+        src: templates/env.j2
+        dest: "{{ deploy_root }}/.env"
+        mode: "0600"
+      no_log: true
+      notify: Reiniciar los servicios
+
+    # --- 3. Inicializar Vault (solo la primera vez) --------------------------
+    - name: Comprobar si Vault ya esta inicializado
+      ansible.builtin.command:
+        cmd: docker compose exec -T vault vault status
+      register: vault_status
+      changed_when: false
+      failed_when: false
+      environment:
+        VAULT_ADDR: http://localhost:8200
+        VAULT_TOKEN: "{{ labmastery_vault_root_token }}"
+
+    - name: Inicializar y desatascar Vault
+      ansible.builtin.command:
+        cmd: docker compose exec -T vault vault operator init -key-shares=1 -key-threshold=1 -format=json
+      register: vault_init
+      changed_when: true
+      when: vault_status.rc != 0
+      no_log: true
+
+    - name: Desatascar Vault
+      ansible.builtin.command:
+        cmd: docker compose exec -T vault vault operator unseal {{ vault_init.json.unseal_keys_b64[0] }}
+      when: vault_status.rc != 0
+      changed_when: true
+      no_log: true
+
+    - name: Publicar las politicas de Vault
+      ansible.builtin.command:
+        cmd: "docker compose exec -T vault vault policy write {{ item.name }} -"
+        stdin: "{{ lookup('file', 'vault/policies/' + item.file) }}"
+      loop:
+        - { name: labmastery-web, file: labmastery-web.hcl }
+        - { name: labmastery-console, file: labmastery-console.hcl }
+        - { name: labmastery-orchestrator, file: labmastery-orchestrator.hcl }
+      changed_when: true
+      when: vault_status.rc != 0
+
+    - name: Activar el mount KV v2
+      ansible.builtin.command:
+        cmd: docker compose exec -T vault vault secrets enable -path=secret -version=2 kv
+      changed_when: true
+      failed_when: false
+      when: vault_status.rc != 0
+
+    - name: Crear el token de servicio de la consola
+      ansible.builtin.command:
+        cmd: docker compose exec -T vault vault token create -policy=labmastery-console -ttl=0 -format=json
+      register: console_token
+      changed_when: true
+      when: vault_status.rc != 0
+      no_log: true
+
+    # --- 4. Levantar el compose ---------------------------------------------
+    - name: Levantar el stack
+      ansible.builtin.command:
+        cmd: docker compose up -d --remove-orphans
+      args:
+        chdir: "{{ deploy_root }}"
+      changed_when: true
+
+    - name: Esperar a que los servicios esten sanos
+      ansible.builtin.command:
+        cmd: "docker compose ps --format '{{.Service}} {{.Status}}'"
+      register: ps_out
+      until: ps_out.stdout is not search('unhealthy|starting|exited')
+      retries: 30
+      delay: 10
+      changed_when: false
+      args:
+        chdir: "{{ deploy_root }}"
+
+  handlers:
+    - name: Reiniciar los servicios
+      ansible.builtin.command:
+        cmd: docker compose up -d --force-recreate
+      args:
+        chdir: "{{ deploy_root }}"
+      changed_when: true

@@ -1,0 +1,24 @@
+# El .env lo genera el playbook de ansible-vault. NUNCA se commitea.
+.env
+.env.local
+*.env
+!*.env.example
+
+# Material de ansible-vault (el fichero cifrado SÍ se commitea).
+ansible/vault/*.retry
+*.vault_pass
+vault_password*
+
+# Certificados TLS.
+haproxy/certs/*
+!haproxy/certs/.gitkeep
+!haproxy/certs/README.md
+
+# Datos de Vault en local (modo dev).
+vault-data/
+vault-audit/
+
+# Logs y temporales.
+*.log
+.cache/
+node_modules/
