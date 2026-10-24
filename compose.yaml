@@ -193,6 +193,37 @@ services:
       - mgmt
       - data
 
+  # --- Gateway de sessions (H1) ----------------------------------------------
+  # Pont WebSocket ↔ SSH cap als contenidors de lab. El navegador obre
+  # wss://gateway.<dominio>/terminal?token=… con un token que emite el orquestador
+  # (xifrado, con destino interno y caducidad): nunca ve IPs ni credenciales.
+  #
+  # Solo en la red mgmt: necesita alcanzar los contenedores de lab (red del host
+  # DinD) y HAProxy lo publica. No habla con el daemon de Docker.
+  gateway:
+    image: ${IMAGE_GATEWAY:?falta IMAGE_GATEWAY (tag inmutable)}
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      NODE_ENV: production
+      PORT: "4200"
+      HOST: 0.0.0.0
+      # El MISMO valor que el orquestador: es lo que abre los tokens de conexión
+      GATEWAY_TOKEN_SECRET: ${GATEWAY_TOKEN_SECRET:?falta GATEWAY_TOKEN_SECRET}
+      GATEWAY_SSH_USER: ${GATEWAY_SSH_USER:-student}
+      GATEWAY_SSH_PASSWORD: ${GATEWAY_SSH_PASSWORD:-}
+      GATEWAY_IDLE_TIMEOUT_SECONDS: ${GATEWAY_IDLE_TIMEOUT_SECONDS:-900}
+      TRUST_PROXY: "true"
+      LOG_PRETTY: "0"
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:4200/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks:
+      - mgmt
+
   # --- Web -------------------------------------------------------------------
   web:
     image: ${IMAGE_WEB:?falta IMAGE_WEB (tag inmutable)}

@@ -1,0 +1,43 @@
+# syntax=docker/dockerfile:1.7
+# LabMastery — imagen del gateway de sesiones (H1).
+#
+# CONTEXTO DE BUILD: la raiz de los repos (c:\dev\LabMastery).
+#
+#   docker build -f labmastery-deploy/docker/Dockerfile.gateway -t labmastery-gateway .
+#
+# El gateway NO depende de los paquetes @labmastery/*: solo fastify, ws, ssh2 y pino.
+# Eso lo hace independiente del truco de los paquetes `file:` (D23 §4.1).
+
+# ---------- Etapa 1: dependencias --------------------------------------------
+FROM node:24-alpine AS deps
+WORKDIR /app
+
+COPY labmastery-gateway/package.json ./labmastery-gateway/
+
+RUN cd /app/labmastery-gateway \
+ && npm install --no-audit --no-fund --omit=dev
+
+# ---------- Etapa 2: aplicacion ----------------------------------------------
+FROM node:24-alpine AS app
+WORKDIR /app
+
+ENV NODE_ENV=production
+
+COPY --from=deps /app/labmastery-gateway/node_modules ./labmastery-gateway/node_modules
+COPY labmastery-gateway/package.json ./labmastery-gateway/
+COPY labmastery-gateway/src ./labmastery-gateway/src
+COPY labmastery-gateway/tsconfig.json ./labmastery-gateway/
+
+WORKDIR /app/labmastery-gateway
+
+USER node
+
+EXPOSE 4200
+
+ENV PORT=4200 \
+    HOST=0.0.0.0
+
+HEALTHCHECK --interval=15s --timeout=5s --start-period=20s --retries=10 \
+  CMD node -e "fetch('http://127.0.0.1:4200/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+
+CMD ["node", "src/index.ts"]
