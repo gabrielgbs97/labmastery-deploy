@@ -60,6 +60,13 @@ RUN set -eux; \
     chmod 0440 /etc/sudoers.d/student
 
 # sshd: sin login de root, con claves y contraseña (el orquestador inyecta ambas).
+#
+# `Subsystem sftp` ya viene en /etc/ssh/sshd_config: repetirlo hace que sshd NO arranque
+# («Subsystem 'sftp' already defined»). Se deja el de la imagen base.
+#
+# El PTY necesita CAP_AUDIT_WRITE (`pam_loginuid` escribe la audit session id): sin esa capacidad,
+# toda sesión interactiva muere con «Unable to request a pseudo-terminal». La capacidad la añade
+# el orquestador al crear el contenedor (ver `CapAdd` en el DockerProvider), no la imagen.
 RUN set -eux; \
     mkdir -p /var/run/sshd /home/student/.ssh; \
     chmod 700 /home/student/.ssh; \
@@ -72,7 +79,6 @@ RUN set -eux; \
       'X11Forwarding no' \
       'PrintMotd no' \
       'AcceptEnv LANG LC_*' \
-      'Subsystem sftp /usr/lib/openssh/sftp-server' \
       > /etc/ssh/sshd_config.d/labmastery.conf; \
     ssh-keygen -A
 
