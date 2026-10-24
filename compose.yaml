@@ -42,6 +42,8 @@ volumes:
     name: ${STACK_NAME:-labmastery}-vaultdata
   vault-audit:
     name: ${STACK_NAME:-labmastery}-vault-audit
+  dinddata:
+    name: ${STACK_NAME:-labmastery}-dinddata
 
   haproxy-state:
     name: ${STACK_NAME:-labmastery}-haproxy-state
@@ -130,6 +132,38 @@ services:
     networks:
       - mgmt
 
+  # --- Docker-in-Docker (host de los labs) ------------------------------------
+  # El orquestador gestiona el ciclo de vida de los contenedores de lab a través
+  # de la API del Docker Engine (D24). Este servicio es el "host" que los aloja.
+  #
+  # Aislamiento: vive SOLO en la red mgmt (interna), no publica puertos y NO se
+  # monta el socket del host principal (eso daría acceso al host real). El daemon
+  # escucha en TCP dentro de la red interna; el orquestador lo alcanza por
+  # provider.docker.host (configurable desde la consola, D24).
+  #
+  # Perfil `labs`: sin él, el stack arranca sin host de labs (ORCH_PROVIDER=mock).
+  #   docker compose --profile labs up -d
+  dind:
+    image: docker:28-dind
+    profiles: ["labs"]
+    restart: unless-stopped
+    logging: *logging
+    privileged: true
+    environment:
+      DOCKER_TLS_CERTDIR: "" # sin TLS: la red mgmt es interna y no publica puertos
+      DOCKER_HOST: tcp://0.0.0.0:2375
+    command: ["dockerd", "--host=tcp://0.0.0.0:2375", "--host=unix:///var/run/docker.sock", "--tls=false"]
+    volumes:
+      - dinddata:/var/lib/docker
+    healthcheck:
+      test: ["CMD-SHELL", "docker info >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 12
+      start_period: 30s
+    networks:
+      - mgmt
+
   # --- Orquestrador ----------------------------------------------------------
   orchestrator:
     image: ${IMAGE_ORCHESTRATOR:?falta IMAGE_ORCHESTRATOR (tag inmutable)}
@@ -145,6 +179,9 @@ services:
       GATEWAY_TOKEN_SECRET: ${GATEWAY_TOKEN_SECRET:?falta GATEWAY_TOKEN_SECRET}
       SETTINGS_SECRET_STORES: ${SETTINGS_SECRET_STORES:?falta SETTINGS_SECRET_STORES}
       ORCH_PROVIDER: ${ORCH_PROVIDER:-mock}
+      # Respaldo por entorno de provider.docker.* (D24): la consola manda (BD > entorno > defecte).
+      # Con el perfil `labs`, apunta al daemon DinD de la red interna.
+      DOCKER_HOST: ${DOCKER_HOST:-tcp://dind:2375}
       LOG_PRETTY: "0"
     healthcheck:
       test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:4000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
@@ -203,7 +240,7 @@ services:
       SETTINGS_SECRET_STORES: ${SETTINGS_SECRET_STORES:?falta SETTINGS_SECRET_STORES}
       AUTH_MODE: ${AUTH_MODE:-oauth}
       OAUTH_PUBLIC_URL: ${OAUTH_PUBLIC_URL:?falta OAUTH_PUBLIC_URL}
-      CONSUME_OAUTH_USERS: ${CONSOLE_OAUTH_USERS:-[]}
+      CONSOLE_OAUTH_USERS: ${CONSOLE_OAUTH_USERS:-[]}
       S3_ENDPOINT: ${S3_ENDPOINT:-http://s3:9000}
       S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:?falta S3_ACCESS_KEY_ID}
       S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:?falta S3_SECRET_ACCESS_KEY}
